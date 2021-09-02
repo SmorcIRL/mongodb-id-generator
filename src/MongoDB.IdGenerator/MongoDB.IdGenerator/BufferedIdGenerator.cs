@@ -24,7 +24,6 @@ namespace SmorcIRL.MongoDB.IdGenerator
         private readonly IMongoClient _client;
         private readonly IMongoCollection<IdSyncDocument> _collection;
         
-        private CancellationTokenSource _rentingCancellation;
         private readonly SemaphoreSlim _lock;
         private readonly BufferBlock<long> _queue;
         private readonly string _tag;
