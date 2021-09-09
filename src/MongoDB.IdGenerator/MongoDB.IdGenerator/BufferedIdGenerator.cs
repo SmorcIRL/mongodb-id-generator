@@ -40,7 +40,6 @@ namespace SmorcIRL.MongoDB.IdGenerator
             _collection = collection ?? throw new ArgumentNullException(nameof(collection));
             _tag = tag ?? throw new ArgumentNullException(nameof(tag));
 
-            _rentingCancellation = new CancellationTokenSource();
             _lock = new SemaphoreSlim(1);
             _queue = new BufferBlock<long>();
 
