@@ -3,13 +3,12 @@ using MongoDB.Bson.Serialization.Attributes;
 
 namespace SmorcIRL.MongoDB.IdGenerator
 {
-    public class IdSyncDocument
+    [BsonIgnoreExtraElements]
+    public class CustomIdentifierDocument
     {
         [BsonId]
         public ObjectId Id { get; set; }
-
-        public string Tag { get; set; }
-
+        
         public long StartValue { get; set; }
 
         public int HighValue { get; set; }

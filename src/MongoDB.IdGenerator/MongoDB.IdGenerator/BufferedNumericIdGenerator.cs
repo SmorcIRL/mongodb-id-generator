@@ -2,43 +2,32 @@
 using System.Threading;
 using System.Threading.Tasks;
 using System.Threading.Tasks.Dataflow;
+using MongoDB.Bson;
 using MongoDB.Driver;
 
 namespace SmorcIRL.MongoDB.IdGenerator
 {
-    public class BufferedIdGenerator
-    {
-        private const long DefaultStartValue = 1;
-        // After the first increment it'll be 0, so the first rented range will be [StartValue, StartValue + LowValue - 1]
-        private const int DefaultHighValue = -1;
-        // It's possible to change this value during runtime, but that requires recalculation of HighValue in case of decreasing
-        // Also such changing may cause ids leaks so it shouldn't happen too often
-        private const int DefaultLowValue = 20;
+    public class BufferedNumericIdGenerator
+    {   
+        private static readonly UpdateDefinition<CustomIdentifierDocument> IncrementUpdateDefinition = Builders<CustomIdentifierDocument>.Update.Inc(x => x.HighValue, 1);
+        private static readonly FindOneAndUpdateOptions<CustomIdentifierDocument> IncrementOptions = new FindOneAndUpdateOptions<CustomIdentifierDocument> { ReturnDocument = ReturnDocument.After };
 
-        private static readonly FindOneAndUpdateOptions<IdSyncDocument> IncrementOptions = new FindOneAndUpdateOptions<IdSyncDocument>
-        {
-            ReturnDocument = ReturnDocument.After,
-        };
-        private static readonly UpdateDefinition<IdSyncDocument> IncrementDefinition = Builders<IdSyncDocument>.Update.Inc(x => x.HighValue, 1);
-
-        private readonly IMongoClient _client;
-        private readonly IMongoCollection<IdSyncDocument> _collection;
-        
+        private readonly IMongoCollection<CustomIdentifierDocument> _collection;
+        private readonly FilterDefinition<CustomIdentifierDocument> _findDefinition;
         private readonly SemaphoreSlim _lock;
         private readonly BufferBlock<long> _queue;
-        private readonly string _tag;
 
+        private Task _init;
         private long _startValue;
         private int _highValue;
         private int _lowValue;
         private int _committedCount;
         private IdState[] _states;
         
-        public BufferedIdGenerator(IMongoClient client, IMongoCollection<IdSyncDocument> collection, string tag)
+        public BufferedNumericIdGenerator(IMongoCollection<CustomIdentifierDocument> collection, ObjectId id)
         {
-            _client = client ?? throw new ArgumentNullException(nameof(client));
             _collection = collection ?? throw new ArgumentNullException(nameof(collection));
-            _tag = tag ?? throw new ArgumentNullException(nameof(tag));
+            _findDefinition = Builders<CustomIdentifierDocument>.Filter.Eq(x => x.Id, id);
 
             _lock = new SemaphoreSlim(1);
             _queue = new BufferBlock<long>();
@@ -48,42 +37,17 @@ namespace SmorcIRL.MongoDB.IdGenerator
             _lowValue = int.MinValue;
             _states = Array.Empty<IdState>();
         }
-
-        public async Task Init()
+        
+        // document with Id==id must be created before Init() call
+        public Task Init()
         {
-            using (var session = await _client.StartSessionAsync())
+            if (_init == null || _init.IsFaulted)
             {
-                await session.WithTransactionAsync
-                (
-                    async (s, t) =>
-                    {
-                        var doc = await
-                        (
-                            await _collection.FindAsync(s, x => x.Tag == _tag, cancellationToken: t)
-                        ).FirstOrDefaultAsync(t);
-
-                        if (doc == null)
-                        {
-                            await _collection.InsertOneAsync
-                            (
-                                s,
-                                new IdSyncDocument
-                                {
-                                    Tag = _tag,
-                                    StartValue = DefaultStartValue,
-                                    HighValue = DefaultHighValue,
-                                    LowValue = DefaultLowValue,
-                                },
-                                cancellationToken: t
-                            );
-                        }
-
-                        return Task.CompletedTask;
-                    }
-                );
+                _init = RentRange();
+                return _init;
             }
-
-            await RentRange();
+            
+            throw new InvalidOperationException("Generator is already initialized");
         }
 
         public async Task<long> Rent()
@@ -125,10 +89,11 @@ namespace SmorcIRL.MongoDB.IdGenerator
                     }
                     catch
                     {
-                        // Ensures that even if sync doc is corrupted or mongo feels bad, object will be in correct state
-                        _states[index] = IdState.Rented;
+                        // Ensures that even if document is corrupted or there is a network error, object will be in correct state
+                        _states[index] = IdState.Free;
+                        _queue.Post(value);
                         _committedCount--;
-                        
+
                         throw;
                     }
                 }
@@ -159,24 +124,18 @@ namespace SmorcIRL.MongoDB.IdGenerator
 
         private async Task RentRange()
         {
-            IdSyncDocument doc;
+            var doc = await _collection.FindOneAndUpdateAsync
+            (
+                _findDefinition,
+                IncrementUpdateDefinition,
+                IncrementOptions
+            );
 
-            using (var session = await _client.StartSessionAsync())
+            if (doc == null)
             {
-                // Ensures that we get an actual incremented HighValue, even if write conflict happens on update
-                doc = await session.WithTransactionAsync
-                (
-                    (s, t) => _collection.FindOneAndUpdateAsync
-                    (
-                        s,
-                        Builders<IdSyncDocument>.Filter.Eq(x => x.Tag, _tag),
-                        IncrementDefinition,
-                        IncrementOptions,
-                        t
-                    )
-                );
+                throw new InvalidOperationException("No suitable record found");
             }
-            
+
             // Some checks to ensure that no range overlapping will happen
             
             if (doc.HighValue <= _highValue)
@@ -204,7 +163,7 @@ namespace SmorcIRL.MongoDB.IdGenerator
                 _states = new IdState[_lowValue];
             }
 
-            var min = _startValue + _highValue * _lowValue;
+            var min = _startValue + (_highValue - 1) * _lowValue;
 
             for (var i = 0; i < _lowValue; i++)
             {
@@ -232,7 +191,7 @@ namespace SmorcIRL.MongoDB.IdGenerator
 
         private long GetIndexByValue(long value)
         {
-            return value - _lowValue * _highValue - _startValue;
+            return value - (_highValue - 1) * _lowValue - _startValue;
         }
 
         private enum IdState : byte
